@@ -14,7 +14,12 @@ fully specified exact tie-breaking. A fifth endpoint samples a finite number
 of ions independently from the full envelope and computes, exactly over Q,
 the joint probability that every (possibly overlapping) detection window
 collects at least its required number of hits, together with each window's
-marginal success probability.
+marginal success probability. A sixth endpoint performs exact Bayesian
+candidate/offset inference: each of 2-4 mutually exclusive candidates
+carries its own envelope and an ``n/d`` prior, all ions share one
+uniform-prior integer calibration offset, and the exact multinomial
+likelihood of binned ion counts yields joint, per-candidate and per-offset
+posteriors, all reduced over Q.
 """
 
 from __future__ import annotations
@@ -260,6 +265,70 @@ class DetectionProbabilityResponse(BaseModel):
     joint_probability: str  # reduced fraction "n/d"
     # marginal_probabilities[j]: P(window j reaches min_hits), input order.
     marginal_probabilities: List[str]  # reduced "n/d"
+
+
+class PosteriorObservation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    shift_mda: int = Field(strict=True, ge=0, le=2000)
+    count: int = Field(strict=True, ge=0, le=80)
+
+
+class PosteriorCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    atom_groups: List[AtomGroup] = Field(min_length=1, max_length=4)
+    prior: str
+
+    @field_validator("prior")
+    @classmethod
+    def _validate_prior(cls, value: str) -> str:
+        parse_abundance(value)
+        return value
+
+    @model_validator(mode="after")
+    def _validate_candidate(self) -> "PosteriorCandidate":
+        validate_atom_groups(self.atom_groups)
+        return self
+
+    @property
+    def prior_fraction(self) -> Fraction:
+        return parse_abundance(self.prior)
+
+
+class CandidatePosteriorRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: List[PosteriorCandidate] = Field(min_length=2, max_length=4)
+    ion_count: int = Field(strict=True, ge=1, le=80)
+    observations: List[PosteriorObservation] = Field(min_length=1, max_length=8)
+    calibration_radius: int = Field(strict=True, ge=0, le=3)
+
+    @model_validator(mode="after")
+    def _validate_request(self) -> "CandidatePosteriorRequest":
+        if sum(
+            (candidate.prior_fraction for candidate in self.candidates),
+            Fraction(0),
+        ) != 1:
+            raise ValueError("candidate priors must be non-negative and sum to 1")
+        shifts = [obs.shift_mda for obs in self.observations]
+        if len(set(shifts)) != len(shifts):
+            raise ValueError("observation shift_mda values must be distinct")
+        if sum(obs.count for obs in self.observations) > self.ion_count:
+            raise ValueError("observation counts must sum to <= ion_count")
+        return self
+
+
+class CandidatePosteriorResponse(BaseModel):
+    possible: bool
+    # joint_posteriors[i][j]: P(candidate i, offset delta_j | data), candidates
+    # in input order and offsets ascending within each candidate.
+    joint_posteriors: Optional[List[List[str]]] = None
+    # candidate_posteriors[i]: P(candidate i | data), input order.
+    candidate_posteriors: Optional[List[str]] = None
+    # offset_posteriors[j]: P(offset delta_j | data), offsets ascending.
+    offset_posteriors: Optional[List[str]] = None
+    offsets: Optional[List[int]] = None
 
 
 def convolve(left: Distribution, right: Distribution) -> Distribution:
@@ -739,7 +808,89 @@ def detection_probability(
     return joint, marginals
 
 
-app = FastAPI(title="Isotope Envelope API", version="1.4.0")
+def multinomial_binned_likelihood(
+    dist: Distribution,
+    observations: List[Tuple[int, int]],
+    ion_count: int,
+) -> Fraction:
+    """Exact multinomial probability of binned ion counts, over Q.
+
+    Each ion is drawn independently from ``dist``; ``observations`` lists
+    ``(measured shift, count)`` bins and every unlisted shift collapses into
+    a single "other" bin holding the remaining ions. Returns the multinomial
+    probability of exactly that count vector. Following the standard
+    combinatorial convention ``0**0 = 1``, a zero-probability bin with a
+    zero count contributes nothing; the likelihood is zero exactly when a
+    positive-count bin (including "other") has zero probability.
+    """
+    remaining = ion_count
+    likelihood = Fraction(1)
+    covered = Fraction(0)
+    for shift, count in observations:
+        probability = dist.get(shift, Fraction(0))
+        likelihood *= probability**count
+        covered += probability
+        remaining -= count
+    other_probability = Fraction(1) - covered
+    likelihood *= other_probability**remaining
+    return likelihood
+
+
+def candidate_posterior(
+    envelopes: List[Distribution],
+    priors: List[Fraction],
+    observations: List[Tuple[int, int]],
+    ion_count: int,
+    radius: int,
+) -> Optional[Tuple[List[List[Fraction]], List[Fraction], List[Fraction]]]:
+    """Exact joint/candidate/offset posteriors, or None when data impossible.
+
+    Candidate ``i`` is drawn once with prior ``priors[i]``; conditioned on it,
+    all ions share one calibration offset delta drawn uniformly from
+    ``[-radius, radius]``, and each ion's measured shift is its independently
+    sampled envelope shift plus delta. The likelihood of the observed
+    count vector is the exact multinomial probability under
+    ``multinomial_binned_likelihood`` against the shifted envelope. Joint
+    unnormalized weights are
+
+        prior_i * (1/(2r+1)) * multinomial(counts | candidate i, delta)
+
+    (the multinomial coefficient is common to every weight and omitted).
+    Every weight is reduced exactly once; when the total evidence is zero the
+    observation has probability zero under every hypothesis and the caller
+    reports ``possible=false`` with no posteriors. Returns the joint table
+    (candidate input order, offsets ascending within each candidate), the
+    per-candidate marginals and the per-offset marginals, all normalized.
+    """
+    offsets = list(range(-radius, radius + 1))
+    weights: List[List[Fraction]] = []
+    for dist, prior in zip(envelopes, priors):
+        row: List[Fraction] = []
+        for delta in offsets:
+            shifted = {shift + delta: prob for shift, prob in dist.items()}
+            likelihood = multinomial_binned_likelihood(
+                shifted, observations, ion_count
+            )
+            # The uniform 1/(2r+1) offset prior is common to every cell and
+            # cancels in normalization, but keep it explicit for exactness.
+            row.append(prior * likelihood / len(offsets))
+        weights.append(row)
+
+    total = sum((sum(row, Fraction(0)) for row in weights), Fraction(0))
+    if total == 0:
+        return None
+    joints = [[weight / total for weight in row] for row in weights]
+    candidate_marginals = [
+        sum(row, Fraction(0)) / total for row in weights
+    ]
+    offset_marginals = [
+        sum(weights[i][j] for i in range(len(weights))) / total
+        for j in range(len(offsets))
+    ]
+    return joints, candidate_marginals, offset_marginals
+
+
+app = FastAPI(title="Isotope Envelope API", version="1.5.0")
 
 
 @app.post("/v1/envelope", response_model=EnvelopeResponse)
@@ -835,6 +986,48 @@ def compute_detection_probability(
     return DetectionProbabilityResponse(
         joint_probability=to_fraction_str(joint),
         marginal_probabilities=[to_fraction_str(value) for value in marginals],
+    )
+
+
+@app.post(
+    "/v1/candidate-posterior",
+    response_model=CandidatePosteriorResponse,
+    response_model_exclude_none=True,
+)
+def compute_candidate_posterior(
+    request: CandidatePosteriorRequest,
+) -> CandidatePosteriorResponse:
+    envelopes = [
+        envelope_distribution(candidate.atom_groups)
+        for candidate in request.candidates
+    ]
+    priors = [candidate.prior_fraction for candidate in request.candidates]
+    observations = [(obs.shift_mda, obs.count) for obs in request.observations]
+    result = candidate_posterior(
+        envelopes,
+        priors,
+        observations,
+        request.ion_count,
+        request.calibration_radius,
+    )
+    if result is None:
+        return CandidatePosteriorResponse(possible=False)
+    joints, candidate_marginals, offset_marginals = result
+    offsets = list(
+        range(-request.calibration_radius, request.calibration_radius + 1)
+    )
+    return CandidatePosteriorResponse(
+        possible=True,
+        joint_posteriors=[
+            [to_fraction_str(value) for value in row] for row in joints
+        ],
+        candidate_posteriors=[
+            to_fraction_str(value) for value in candidate_marginals
+        ],
+        offset_posteriors=[
+            to_fraction_str(value) for value in offset_marginals
+        ],
+        offsets=offsets,
     )
 
 
