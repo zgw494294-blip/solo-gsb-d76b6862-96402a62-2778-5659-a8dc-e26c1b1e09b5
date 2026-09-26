@@ -5,7 +5,8 @@
 所有路径按质量偏移合并，全程使用 `fractions.Fraction` 运算，**不中途裁剪任何路径**。
 此外还提供：给定单个观测峰的**归因**接口（该峰的精确概率与条件期望原子数），针对
 观测峰概率区间求解多组分混合比例的接口，在固定采样预算下规划**采集窗口**的接口，
-以及有限离子采样下多个（可重叠）检测窗口同时达标的**联合检出概率**接口，
+有限离子采样下多个（可重叠）检测窗口同时达标的**联合检出概率**接口，
+以及在共享整数校准偏移下对多个互斥候选做**计数观测后验推断**的接口，
 同样全程精确有理数运算。
 
 ## 启动
@@ -412,6 +413,117 @@ curl -s -X POST http://localhost:8000/v1/detection-probability \
   }'
 ```
 
+### `POST /v1/candidate-posterior`
+
+给定 2～4 个**互斥候选**（各自复用完整峰型，并带一个 `"n/d"` 先验）、`ion_count` 个
+离子的**计数观测**（各偏移处测得的离子数）以及校准半径 `r`：所有离子共用一个整数
+校准偏移 `δ ∈ [−r, r]`（δ 取**等先验**）；给定候选与 δ，各离子独立地从该候选的完整
+峰型中采样，**测得偏移 = 原偏移 + δ**。未列出的偏移全部归入 `other`，其计数为剩余
+离子数（`ion_count − Σ count`）。在 (候选, δ) 下计数向量服从**多项分布**，以其为
+似然对 `先验 × 均匀 δ` 做精确贝叶斯归一化，全程有理数运算。
+
+请求体：
+
+```json
+{
+  "candidates": [
+    {
+      "atom_groups": [
+        {"count": 1, "isotopes": [
+          {"shift_mda": 0, "abundance": "1/2"},
+          {"shift_mda": 1, "abundance": "1/2"}
+        ]}
+      ],
+      "prior": "1/2"
+    },
+    {
+      "atom_groups": [
+        {"count": 1, "isotopes": [
+          {"shift_mda": 0, "abundance": "1/2"},
+          {"shift_mda": 2, "abundance": "1/2"}
+        ]}
+      ],
+      "prior": "1/2"
+    }
+  ],
+  "ion_count": 1,
+  "observations": [
+    {"shift_mda": 1, "count": 1}
+  ],
+  "calibration_radius": 1
+}
+```
+
+字段与约束（任一不满足即返回 **422**）：
+
+| 字段 | 约束 |
+| --- | --- |
+| `candidates` | 2～4 个候选；峰型相同的候选仍保留为独立候选 |
+| `candidates[].atom_groups` | 与 `/v1/envelope` 完全相同的校验（1～4 组、各组 `count` 总和 ≤ 80、最大可能总偏移 ≤ 2000 等） |
+| `candidates[].prior` | 与 `abundance` 相同的 `"n/d"` 格式及范围（非负）；**所有候选先验之和必须精确等于 1** |
+| `ion_count` | 整数，1～80 |
+| `observations` | 1～8 条；各观测 `shift_mda` **不得重复** |
+| `observations[].shift_mda` | 整数，0～2000 |
+| `observations[].count` | 非负整数；所有观测计数之和 ≤ `ion_count` |
+| `calibration_radius` | 整数，0～3 |
+
+响应（200）。观测在所有 (候选, δ) 下概率均为零时：
+
+```json
+{"possible": false}
+```
+
+否则：
+
+```json
+{
+  "possible": true,
+  "joint_posteriors": [["0/1", "1/4", "1/4"], ["1/4", "0/1", "1/4"]],
+  "candidate_posteriors": ["1/2", "1/2"],
+  "offset_posteriors": ["1/4", "1/4", "1/2"]
+}
+```
+
+- `joint_posteriors`：二维 `n/d` 数组，`joint_posteriors[c][k]` 为
+  （第 `c` 个候选，δ = `k − calibration_radius`）的联合后验——候选按**输入顺序**、
+  δ 按**升序**排列；每行长度为 `2·calibration_radius + 1`。
+- `candidate_posteriors`：各候选的边际后验（对 δ 求和），按候选输入顺序。
+- `offset_posteriors`：各 δ 的边际后验（对候选求和），按 δ 升序（`-r, …, r`）。
+- 三者均为已约分的 `"n/d"`；`joint_posteriors` 全部元素之和恒为 `1/1`，
+  行和即 `candidate_posteriors`，列和即 `offset_posteriors`。
+- `possible=false` 时不返回任何后验字段。
+
+上例中测得偏移 1 可由（候选 0, δ=0）、（候选 0, δ=1）、（候选 1, δ=−1）、
+（候选 1, δ=1）四种等权假设解释（各 1/4），故 δ=1 的边际后验为 1/2。
+
+### 调用示例
+
+```bash
+curl -s -X POST http://localhost:8000/v1/candidate-posterior \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "candidates": [
+      {"atom_groups": [
+        {"count": 1, "isotopes": [
+          {"shift_mda": 0, "abundance": "1/2"},
+          {"shift_mda": 1, "abundance": "1/2"}
+        ]}
+      ], "prior": "1/2"},
+      {"atom_groups": [
+        {"count": 1, "isotopes": [
+          {"shift_mda": 0, "abundance": "1/2"},
+          {"shift_mda": 2, "abundance": "1/2"}
+        ]}
+      ], "prior": "1/2"}
+    ],
+    "ion_count": 1,
+    "observations": [
+      {"shift_mda": 1, "count": 1}
+    ],
+    "calibration_radius": 1
+  }'
+```
+
 ### `GET /healthz`
 
 健康检查，返回 `{"status": "ok"}`。
@@ -454,6 +566,17 @@ curl -s -X POST http://localhost:8000/v1/detection-probability \
 概率（从最终状态中按位汇总）各自仅在最后构造一次 `Fraction` 约分输出；不可能达标
 的窗口自然得到分子 0，即精确的 `"0/1"`。
 
+`/v1/candidate-posterior` 对每个候选复用完整峰型分布；在 (候选 c, 偏移 δ) 下，
+各离子的测得偏移为"峰型偏移 + δ"，计数观测的似然即列出偏移与 `other` 桶上的
+**多项分布** `Π p_i^{n_i} · p_other^{n_other}`（其中 `p_i` 为峰型在
+`shift_i − δ` 处的概率，`p_other = 1 − Σ p_i`，`n_other = ion_count − Σ n_i`）。
+多项式系数与 δ 的均匀先验 `1/(2r+1)` 对所有 (c, δ) 相同，在归一化中约去，故权重
+直接取 `prior_c · 似然`。每个候选的峰概率乘以其分母的最小公倍数转成**整数**，
+似然因此是整数幂次乘积，公共因子 `scale**(−ion_count)` 以一次 `Fraction` 构造折回；
+全部 (c, δ) 权重求和归一化即得联合后验，按行/列求和得到候选与 δ 的边际后验，
+所有输出仅在最后约分一次。所有权重之和为零（观测在模型下概率为零）时返回
+`possible=false`。
+
 ## 测试
 
 ```bash
@@ -464,17 +587,19 @@ pytest
 测试包含与逐路径暴力枚举（`itertools.product`）的对拍、与独立精确求解器
 （区间收缩 / 盒子公式 / Fourier-Motzkin 消元）的随机对拍、采集窗口规划与
 穷举所有不相交窗口组合的暴力求解器的随机对拍、检出概率与枚举全部离子采样
-序列的暴力求解器的随机对拍，以及全部非法输入的 422 用例。
+序列的暴力求解器的随机对拍、候选后验与逐（候选，偏移）枚举全部离子采样
+序列并统计测得偏移计数的暴力求解器的随机对拍，以及全部非法输入的 422 用例。
 
 ## 项目结构
 
 ```
-app/main.py          # FastAPI 应用：校验模型 + 精确卷积 + 精确有理数 LP + 采集窗口 DP + 检出概率 DP
+app/main.py          # FastAPI 应用：校验模型 + 精确卷积 + 精确有理数 LP + 采集窗口 DP + 检出概率 DP + 候选后验
 tests/test_envelope.py
 tests/test_peak_attribution.py
 tests/test_mixture_bounds.py
 tests/test_acquisition_plan.py
 tests/test_detection_probability.py
+tests/test_candidate_posterior.py
 requirements.txt     # 运行依赖
 requirements-dev.txt # 测试依赖
 Dockerfile

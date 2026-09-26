@@ -14,7 +14,11 @@ fully specified exact tie-breaking. A fifth endpoint samples a finite number
 of ions independently from the full envelope and computes, exactly over Q,
 the joint probability that every (possibly overlapping) detection window
 collects at least its required number of hits, together with each window's
-marginal success probability.
+marginal success probability. A sixth endpoint compares mutually exclusive
+candidates (each a full envelope with an n/d prior) against counted peak
+observations made under a shared integer calibration offset with a uniform
+prior, and returns the exact posterior over (candidate, offset) pairs
+together with both marginals, all over Q.
 """
 
 from __future__ import annotations
@@ -260,6 +264,70 @@ class DetectionProbabilityResponse(BaseModel):
     joint_probability: str  # reduced fraction "n/d"
     # marginal_probabilities[j]: P(window j reaches min_hits), input order.
     marginal_probabilities: List[str]  # reduced "n/d"
+
+
+class Candidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    atom_groups: List[AtomGroup] = Field(min_length=1, max_length=4)
+    prior: str  # n/d, non-negative; all candidate priors must sum to 1
+
+    @field_validator("prior")
+    @classmethod
+    def _validate_prior(cls, value: str) -> str:
+        parse_abundance(value)
+        return value
+
+    @model_validator(mode="after")
+    def _validate_candidate(self) -> "Candidate":
+        validate_atom_groups(self.atom_groups)
+        return self
+
+    @property
+    def prior_fraction(self) -> Fraction:
+        return parse_abundance(self.prior)
+
+
+class CountObservation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    shift_mda: int = Field(strict=True, ge=0, le=2000)
+    count: int = Field(strict=True, ge=0)
+
+
+class CandidatePosteriorRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: List[Candidate] = Field(min_length=2, max_length=4)
+    ion_count: int = Field(strict=True, ge=1, le=80)
+    observations: List[CountObservation] = Field(min_length=1, max_length=8)
+    calibration_radius: int = Field(strict=True, ge=0, le=3)
+
+    @model_validator(mode="after")
+    def _validate_request(self) -> "CandidatePosteriorRequest":
+        total = sum(
+            (candidate.prior_fraction for candidate in self.candidates),
+            Fraction(0),
+        )
+        if total != 1:
+            raise ValueError("candidate priors must sum to exactly 1")
+        shifts = [obs.shift_mda for obs in self.observations]
+        if len(set(shifts)) != len(shifts):
+            raise ValueError("observation shift_mda values must be distinct")
+        if sum(obs.count for obs in self.observations) > self.ion_count:
+            raise ValueError("observation counts must sum to <= ion_count")
+        return self
+
+
+class CandidatePosteriorResponse(BaseModel):
+    possible: bool
+    # joint_posteriors[c][k]: P(candidate c, offset = k - calibration_radius);
+    # candidates in input order, offsets ascending. Reduced "n/d".
+    joint_posteriors: Optional[List[List[str]]] = None
+    # candidate_posteriors[c]: P(candidate c), input order, reduced "n/d".
+    candidate_posteriors: Optional[List[str]] = None
+    # offset_posteriors[k]: P(offset = k - calibration_radius), ascending.
+    offset_posteriors: Optional[List[str]] = None
 
 
 def convolve(left: Distribution, right: Distribution) -> Distribution:
@@ -739,7 +807,77 @@ def detection_probability(
     return joint, marginals
 
 
-app = FastAPI(title="Isotope Envelope API", version="1.4.0")
+def candidate_posterior(
+    envelopes: List[Distribution],
+    priors: List[Fraction],
+    ion_count: int,
+    observations: List[Tuple[int, int]],
+    radius: int,
+) -> Optional[Tuple[List[List[Fraction]], List[Fraction], List[Fraction]]]:
+    """Posterior over (candidate, shared calibration offset), exactly over Q.
+
+    Model: a candidate is drawn from ``priors`` and one integer offset
+    delta in [-radius, radius] is drawn uniformly (equal prior); then
+    ``ion_count`` ions are sampled independently from the candidate's full
+    envelope and every measured shift is the drawn shift plus delta. The
+    observations list the measured shifts with their ion counts; every
+    unlisted measured shift falls into an "other" bucket whose count is
+    ``ion_count`` minus the listed counts. Given (candidate, delta) the
+    count vector follows a multinomial over the listed measured shifts plus
+    "other", so the likelihood is a product of per-shift envelope
+    probabilities (evaluated at shift - delta) raised to their counts,
+    times the remaining probability mass raised to the other count.
+
+    The multinomial coefficient and the uniform offset prior 1/(2r+1) are
+    common to every (candidate, delta) pair and cancel in normalization, so
+    they are omitted from the weights. Per candidate the envelope
+    probabilities are scaled by the lcm of their denominators, turning each
+    likelihood into a plain integer product of powers with the factor
+    scale**(-ion_count) folded back in a single Fraction per pair. Returns
+    the joint posterior (candidate-major, offsets ascending), the candidate
+    marginal (input order) and the offset marginal (ascending), or None
+    when the observations have zero probability under every pair.
+    """
+    offsets = list(range(-radius, radius + 1))
+    other_count = ion_count - sum(count for _, count in observations)
+
+    # Unnormalized joint weights prior_c * P(observations | c, delta).
+    unnorm: List[List[Fraction]] = []
+    for envelope, prior in zip(envelopes, priors):
+        scale = 1
+        for prob in envelope.values():
+            scale = scale * prob.denominator // gcd(scale, prob.denominator)
+        scaled = {
+            shift: prob.numerator * (scale // prob.denominator)
+            for shift, prob in envelope.items()
+            if prob != 0
+        }
+        denominator = scale ** ion_count
+        row = []
+        for delta in offsets:
+            weight = 1
+            listed = 0
+            for shift, count in observations:
+                amount = scaled.get(shift - delta, 0)
+                listed += amount
+                weight *= amount ** count
+            weight *= (scale - listed) ** other_count
+            row.append(prior * Fraction(weight, denominator))
+        unnorm.append(row)
+
+    total = sum((weight for row in unnorm for weight in row), Fraction(0))
+    if total == 0:
+        return None
+    joint = [[weight / total for weight in row] for row in unnorm]
+    candidate_marginals = [sum(row, Fraction(0)) / total for row in unnorm]
+    offset_marginals = [
+        sum((row[k] for row in unnorm), Fraction(0)) / total
+        for k in range(len(offsets))
+    ]
+    return joint, candidate_marginals, offset_marginals
+
+
+app = FastAPI(title="Isotope Envelope API", version="1.5.0")
 
 
 @app.post("/v1/envelope", response_model=EnvelopeResponse)
@@ -835,6 +973,46 @@ def compute_detection_probability(
     return DetectionProbabilityResponse(
         joint_probability=to_fraction_str(joint),
         marginal_probabilities=[to_fraction_str(value) for value in marginals],
+    )
+
+
+@app.post(
+    "/v1/candidate-posterior",
+    response_model=CandidatePosteriorResponse,
+    response_model_exclude_none=True,
+)
+def compute_candidate_posterior(
+    request: CandidatePosteriorRequest,
+) -> CandidatePosteriorResponse:
+    envelopes = [
+        envelope_distribution(candidate.atom_groups)
+        for candidate in request.candidates
+    ]
+    priors = [candidate.prior_fraction for candidate in request.candidates]
+    observations = [
+        (obs.shift_mda, obs.count) for obs in request.observations
+    ]
+    result = candidate_posterior(
+        envelopes,
+        priors,
+        request.ion_count,
+        observations,
+        request.calibration_radius,
+    )
+    if result is None:
+        return CandidatePosteriorResponse(possible=False)
+    joint, candidate_marginals, offset_marginals = result
+    return CandidatePosteriorResponse(
+        possible=True,
+        joint_posteriors=[
+            [to_fraction_str(value) for value in row] for row in joint
+        ],
+        candidate_posteriors=[
+            to_fraction_str(value) for value in candidate_marginals
+        ],
+        offset_posteriors=[
+            to_fraction_str(value) for value in offset_marginals
+        ],
     )
 
 
